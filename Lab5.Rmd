@@ -420,3 +420,71 @@ for (real in levels(test_df$categoria_precio)) {
   }
 }
 ```
+
+```{r plot_metricas_nb}
+# Gráfico de barras de métricas por clase
+colores_clase <- c("#6DBF8E", "#5B8DB8", "#E05C5C")
+
+metricas_long <- reshape(metricas_nb,
+                         varying   = c("Precision", "Recall", "F1"),
+                         v.names   = "Valor",
+                         timevar   = "Metrica",
+                         times     = c("Precision", "Recall", "F1"),
+                         direction = "long")
+
+ggplot(metricas_long, aes(x = Clase, y = Valor, fill = Clase)) +
+  geom_col(position = "dodge", width = 0.6, show.legend = FALSE) +
+  geom_text(aes(label = round(Valor, 3)),
+            vjust = -0.4, size = 3.5, fontface = "bold") +
+  facet_wrap(~ Metrica) +
+  scale_fill_manual(values = colores_clase) +
+  ylim(0, 1.1) +
+  labs(title = "Métricas de clasificación por clase — Naive Bayes",
+       x = "Clase", y = "Valor") +
+  theme_minimal(base_size = 12)
+```
+```{r comparacion_clasificadores}
+# Árbol de clasificación para comparar (mismo setup que Lab 4)
+set.seed(42)
+arbol_clasif_comp <- rpart(
+  categoria_precio ~ .,
+  data    = train_df[, c("categoria_precio", vars_clasif)],
+  method  = "class",
+  control = rpart.control(cp = 0.001, maxdepth = 6)
+)
+pred_arbol_clasif <- predict(arbol_clasif_comp,
+                             newdata = test_df, type = "class")
+acc_arbol         <- mean(pred_arbol_clasif == test_df$categoria_precio)
+
+# Tabla resumen
+comparacion_clasif <- data.frame(
+  Modelo    = c("Árbol de Clasificación (maxdepth=6)", "Naive Bayes"),
+  Accuracy  = round(c(acc_arbol, acc_nb) * 100, 2),
+  F1_Eco    = c(round(calcular_f1(
+                  table(Real     = test_df$categoria_precio,
+                        Predicho = pred_arbol_clasif), "Economica")$f1, 3),
+                metricas_nb$F1[metricas_nb$Clase == "Economica"]),
+  F1_Int    = c(round(calcular_f1(
+                  table(Real     = test_df$categoria_precio,
+                        Predicho = pred_arbol_clasif), "Intermedia")$f1, 3),
+                metricas_nb$F1[metricas_nb$Clase == "Intermedia"]),
+  F1_Cara   = c(round(calcular_f1(
+                  table(Real     = test_df$categoria_precio,
+                        Predicho = pred_arbol_clasif), "Cara")$f1, 3),
+                metricas_nb$F1[metricas_nb$Clase == "Cara"])
+)
+
+cat("══ Comparación clasificadores ══\n")
+print(comparacion_clasif)
+
+par(mar = c(5, 5, 4, 2))
+bp_cl <- barplot(comparacion_clasif$Accuracy,
+                 names.arg = comparacion_clasif$Modelo,
+                 col = c("#E8A838", "#E05C5C"), border = "white",
+                 ylim = c(0, 100),
+                 main = "Accuracy — Árbol vs Naive Bayes (test)",
+                 ylab = "Accuracy (%)", cex.names = 0.85)
+text(bp_cl, comparacion_clasif$Accuracy + 1.5,
+     labels = paste0(comparacion_clasif$Accuracy, "%"),
+     cex = 0.9, font = 2)
+```
