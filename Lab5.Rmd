@@ -1,0 +1,281 @@
+---
+title: "Laboratorio 5 – Naive Bayes"
+author: "Anggelie Velásquez, Anthony Lou, Isabella Obando"
+date: "27 de marzo de 2026"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    theme: flatly
+    highlight: tango
+---
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+---
+
+# 1. Librerías y carga de datos
+```{r libraries}
+library(dplyr)
+library(ggplot2)
+library(e1071)       # Naive Bayes
+library(caret)       # confusionMatrix, métricas
+library(rpart)       # para comparar con árbol
+```
+
+```{r load_data}
+load("../../Data/lab5/listings.RData")
+df <- listings
+
+# ── Preprocesamiento (idéntico al Lab 3 y 4) ──────────────────────────────────
+model_df <- listings %>%
+  mutate(
+    price                    = as.numeric(gsub("[$,]", "", price)),
+    is_superhost             = ifelse(host_is_superhost == "t", 1, 0),
+    is_instant_book          = ifelse(instant_bookable  == "t", 1, 0),
+    host_response_rate_num   = as.numeric(gsub("%", "", host_response_rate)),
+    host_acceptance_rate_num = as.numeric(gsub("%", "", host_acceptance_rate)),
+    room_type                = as.factor(room_type)
+  ) %>%
+  select(price, bedrooms, accommodates, bathrooms, beds,
+         review_scores_rating, reviews_per_month,
+         availability_365, minimum_nights,
+         is_superhost, is_instant_book,
+         host_response_rate_num, host_acceptance_rate_num,
+         room_type) %>%
+  filter(!is.na(price), price > 0, price < 1000,
+         !is.na(bedrooms), !is.na(bathrooms), !is.na(beds)) %>%
+  mutate(across(where(is.numeric),
+                ~ ifelse(is.na(.), median(., na.rm = TRUE), .)))
+
+# ── Ingeniería de características ─────────────────────────────────────────────
+model_df <- model_df %>%
+  mutate(
+    price_per_guest  = price / accommodates,
+    beds_per_bedroom = ifelse(bedrooms > 0, beds / bedrooms, beds),
+    size_category    = case_when(
+      accommodates <= 2 ~ "small",
+      accommodates <= 5 ~ "medium",
+      accommodates <= 8 ~ "large",
+      TRUE              ~ "extra_large"
+    ) %>% as.factor(),
+    high_rated        = ifelse(!is.na(review_scores_rating) &
+                               review_scores_rating >= 4.8, 1, 0),
+    high_availability = ifelse(availability_365 > 182, 1, 0)
+  )
+
+# ── Variable respuesta categórica (mismos cortes que Lab 4) ───────────────────
+corte_bajo <- as.numeric(quantile(model_df$price, 0.25))
+corte_alto <- as.numeric(quantile(model_df$price, 0.75))
+
+clasificar_precio <- function(precio, q1, q3) {
+  dplyr::case_when(
+    precio <= q1 ~ "Economica",
+    precio <= q3 ~ "Intermedia",
+    TRUE         ~ "Cara"
+  )
+}
+
+model_df$categoria_precio <- factor(
+  clasificar_precio(model_df$price, corte_bajo, corte_alto),
+  levels = c("Economica", "Intermedia", "Cara")
+)
+
+cat("Dimensiones:", nrow(model_df), "x", ncol(model_df), "\n")
+cat("Corte Q1 (Económica): $", corte_bajo, "\n")
+cat("Corte Q3 (Cara):      $", corte_alto, "\n")
+```
+
+---
+# 2. División Train / Test (misma semilla que Labs anteriores)
+```{r train_test_split}
+set.seed(42)
+
+n         <- nrow(model_df)
+train_idx <- sample(seq_len(n), size = floor(0.70 * n))
+
+train_df <- model_df[ train_idx, ]
+test_df  <- model_df[-train_idx, ]
+
+cat("Total: ", n, "\n")
+cat("Train: ", nrow(train_df), "filas (70%)\n")
+cat("Test:  ", nrow(test_df),  "filas (30%)\n")
+cat("Mediana price Train:", median(train_df$price), "\n")
+cat("Mediana price Test: ", median(test_df$price),  "\n")
+```
+
+---
+# 3. Punto 1 — Naive Bayes para Regresión (precio numérico)
+```{r nb_regresion_setup}
+# Discretizar precio en 20 cuantiles
+breaks_reg <- quantile(train_df$price,
+                       probs = seq(0, 1, length.out = 21),
+                       na.rm = TRUE)
+breaks_reg <- unique(breaks_reg)   # eliminar duplicados si los hay
+
+train_df$price_bin <- cut(train_df$price, breaks = breaks_reg,
+                          include.lowest = TRUE, labels = FALSE)
+test_df$price_bin  <- cut(test_df$price,  breaks = breaks_reg,
+                          include.lowest = TRUE, labels = FALSE)
+
+# Calcular valor central de cada bin (media de precios por bin en train)
+bin_means <- train_df %>%
+  group_by(price_bin) %>%
+  summarise(bin_mean = mean(price, na.rm = TRUE), .groups = "drop")
+
+cat("Número de bins:", length(unique(train_df$price_bin[!is.na(train_df$price_bin)])), "\n")
+cat("Rango de medias de bins: $",
+    round(min(bin_means$bin_mean), 1), "–",
+    round(max(bin_means$bin_mean), 1), "\n")
+```
+```{r nb_regresion_modelo}
+vars_nb <- c("accommodates", "bedrooms", "bathrooms",
+             "review_scores_rating", "reviews_per_month",
+             "availability_365", "minimum_nights",
+             "is_superhost", "is_instant_book",
+             "host_response_rate_num",
+             "high_rated", "high_availability",
+             "beds_per_bedroom", "room_type")
+
+# Convertir price_bin a factor para NB
+train_nb_reg <- train_df[!is.na(train_df$price_bin),
+                          c("price_bin", vars_nb)]
+train_nb_reg$price_bin <- factor(train_nb_reg$price_bin)
+
+set.seed(42)
+nb_reg <- naiveBayes(price_bin ~ ., data = train_nb_reg)
+```
+```{r nb_regresion_prediccion}
+# Predecir bin en test y mapear a valor numérico
+test_nb_reg <- test_df[, vars_nb]
+pred_bin    <- predict(nb_reg, newdata = test_nb_reg)
+pred_bin_num <- as.integer(as.character(pred_bin))
+
+pred_nb_reg <- bin_means$bin_mean[match(pred_bin_num, bin_means$price_bin)]
+
+# Imputar con mediana global si algún bin no tiene correspondencia
+global_median <- median(train_df$price, na.rm = TRUE)
+pred_nb_reg[is.na(pred_nb_reg)] <- global_median
+
+rmse_nb_reg <- sqrt(mean((test_df$price - pred_nb_reg)^2, na.rm = TRUE))
+mae_nb_reg  <- mean(abs(test_df$price - pred_nb_reg),    na.rm = TRUE)
+r2_nb_reg   <- cor(test_df$price, pred_nb_reg,
+                   use = "complete.obs")^2
+
+cat("── Métricas NB Regresión (test) ──\n")
+cat("RMSE:", round(rmse_nb_reg, 2), "\n")
+cat("MAE: ", round(mae_nb_reg,  2), "\n")
+cat("R²:  ", round(r2_nb_reg,   4), "\n")
+```
+
+---
+
+# 4. Punto 2 — Análisis de resultados: NB Regresión
+```{r nb_reg_plots}
+# Predicho vs Real
+par(mar = c(4, 4, 3, 2))
+plot(test_df$price, pred_nb_reg,
+     pch  = 16, col = rgb(0.36, 0.54, 0.72, 0.2),
+     main = "Predicho vs Real — Naive Bayes Regresión",
+     xlab = "Precio real (USD)", ylab = "Precio predicho (USD)",
+     xlim = c(0, 800), ylim = c(0, 800))
+abline(0, 1, col = "#E05C5C", lwd = 2, lty = 2)
+legend("topleft",
+       legend = paste0("R² = ", round(r2_nb_reg, 4)),
+       col = "#E05C5C", lty = 2, lwd = 2, bty = "n")
+
+# Distribución de errores
+errores_nb_reg <- test_df$price - pred_nb_reg
+
+par(mar = c(4, 4, 3, 2))
+hist(errores_nb_reg, breaks = 60,
+     col = "#5B8DB8", border = "white",
+     main = "Distribución de errores — NB Regresión",
+     xlab = "Error (Real − Predicho)", ylab = "Frecuencia")
+abline(v = 0,                    col = "#E05C5C", lwd = 2, lty = 2)
+abline(v = mean(errores_nb_reg), col = "#E8A838", lwd = 2)
+legend("topright",
+       legend = c("Error = 0",
+                  paste0("Media = ", round(mean(errores_nb_reg), 2))),
+       col = c("#E05C5C", "#E8A838"),
+       lty = c(2, 1), lwd = 2, bty = "n")
+
+cat("── Análisis de errores ──\n")
+cat("Error medio:           ", round(mean(errores_nb_reg),   2), "\n")
+cat("Desv. estándar:        ", round(sd(errores_nb_reg),     2), "\n")
+cat("Error mediano:         ", round(median(errores_nb_reg), 2), "\n")
+cat("% predicciones ± $50: ",
+    round(mean(abs(errores_nb_reg) <= 50) * 100, 1), "%\n")
+```
+
+---
+
+# 5. Punto 3 — Comparación con Regresión Lineal y Árbol de Regresión
+
+Se retoman los valores reportados en los labs anteriores con los **mismos
+conjuntos train/test** (`set.seed(42)`, 70/30).
+```{r comparacion_regresion}
+# Regresión lineal múltiple (Lab 3)
+modelo_lm <- lm(price ~ accommodates + bedrooms + bathrooms +
+                  review_scores_rating + reviews_per_month +
+                  availability_365 + minimum_nights +
+                  is_superhost + is_instant_book +
+                  host_response_rate_num +
+                  room_type + high_rated + high_availability,
+                data = train_df)
+
+pred_lm     <- predict(modelo_lm, newdata = test_df)
+rmse_lm     <- sqrt(mean((test_df$price - pred_lm)^2))
+mae_lm      <- mean(abs(test_df$price - pred_lm))
+r2_lm       <- cor(test_df$price, pred_lm)^2
+
+# Árbol de regresión (Lab 4, sin límite de profundidad)
+set.seed(42)
+arbol_reg <- rpart(price ~ .,
+                   data    = train_df[, c("price", vars_nb)],
+                   method  = "anova",
+                   control = rpart.control(cp = 0.001))
+
+pred_arbol   <- predict(arbol_reg, newdata = test_df)
+rmse_arbol   <- sqrt(mean((test_df$price - pred_arbol)^2))
+mae_arbol    <- mean(abs(test_df$price - pred_arbol))
+r2_arbol     <- cor(test_df$price, pred_arbol)^2
+
+# Tabla comparativa
+comparacion_reg <- data.frame(
+  Modelo = c("Regresión Lineal Múltiple",
+             "Árbol de Regresión",
+             "Naive Bayes (bins)"),
+  RMSE   = round(c(rmse_lm,    rmse_arbol,    rmse_nb_reg),  2),
+  MAE    = round(c(mae_lm,     mae_arbol,     mae_nb_reg),   2),
+  R2     = round(c(r2_lm,      r2_arbol,      r2_nb_reg),    4)
+)
+
+cat("══ Comparación de modelos de regresión ══\n")
+print(comparacion_reg)
+
+colores_comp <- c("#5B8DB8", "#E8A838", "#E05C5C")
+par(mar = c(5, 5, 4, 2))
+bp <- barplot(comparacion_reg$RMSE,
+              names.arg = comparacion_reg$Modelo,
+              col = colores_comp, border = "white",
+              ylim = c(0, max(comparacion_reg$RMSE) * 1.25),
+              main = "Comparación RMSE — modelos de regresión (test)",
+              ylab = "RMSE (USD)", las = 2, cex.names = 0.8)
+text(bp, comparacion_reg$RMSE + 1,
+     labels = comparacion_reg$RMSE, cex = 0.85, font = 2)
+
+bp2 <- barplot(comparacion_reg$R2,
+               names.arg = comparacion_reg$Modelo,
+               col = colores_comp, border = "white",
+               ylim = c(0, 1),
+               main = "Comparación R² — modelos de regresión (test)",
+               ylab = "R²", las = 2, cex.names = 0.8)
+text(bp2, comparacion_reg$R2 + 0.02,
+     labels = comparacion_reg$R2, cex = 0.85, font = 2)
+abline(h = 0.5, col = "gray40", lwd = 1, lty = 2)
+
+mejor_reg <- comparacion_reg$Modelo[which.min(comparacion_reg$RMSE)]
+cat("\nModelo con menor RMSE:", mejor_reg, "\n")
+```
