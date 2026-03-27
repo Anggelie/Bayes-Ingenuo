@@ -279,3 +279,144 @@ abline(h = 0.5, col = "gray40", lwd = 1, lty = 2)
 mejor_reg <- comparacion_reg$Modelo[which.min(comparacion_reg$RMSE)]
 cat("\nModelo con menor RMSE:", mejor_reg, "\n")
 ```
+# 6. Punto 4 — Naive Bayes para Clasificación
+
+Variable respuesta: `categoria_precio` (Económica / Intermedia / Cara),
+definida con los mismos cortes Q1 = $`r corte_bajo` y Q3 = $`r corte_alto`.
+El **precio no se incluye** como predictor para evitar data leakage.
+```{r nb_clasificacion}
+vars_clasif <- c("accommodates", "bedrooms", "bathrooms",
+                 "review_scores_rating", "reviews_per_month",
+                 "availability_365", "minimum_nights",
+                 "is_superhost", "is_instant_book",
+                 "host_response_rate_num",
+                 "high_rated", "high_availability",
+                 "beds_per_bedroom", "room_type")
+
+set.seed(42)
+nb_clasif <- naiveBayes(
+  categoria_precio ~ .,
+  data = train_df[, c("categoria_precio", vars_clasif)]
+)
+```
+# 7. Punto 5 — Predicción en conjunto de prueba
+```{r nb_clasif_prediccion}
+pred_nb_clasif <- predict(nb_clasif,
+                          newdata = test_df[, vars_clasif])
+
+# Probabilidades posteriores
+prob_nb_clasif <- predict(nb_clasif,
+                          newdata = test_df[, vars_clasif],
+                          type    = "raw")
+
+cat("── Primeras 6 predicciones con probabilidades ──\n")
+head(data.frame(
+  Real     = test_df$categoria_precio,
+  Predicho = pred_nb_clasif,
+  round(prob_nb_clasif, 3)
+))
+
+acc_nb <- mean(pred_nb_clasif == test_df$categoria_precio)
+cat("\nAccuracy global: ", round(acc_nb * 100, 2), "%\n")
+```
+```{r nb_clasif_dist}
+# Distribución predicha vs real
+par(mfrow = c(1, 2), mar = c(5, 4, 3, 2))
+barplot(prop.table(table(test_df$categoria_precio)) * 100,
+        col = c("#6DBF8E", "#5B8DB8", "#E05C5C"), border = "white",
+        ylim = c(0, 60), las = 2,
+        main = "Distribución real (test)", ylab = "% de registros")
+barplot(prop.table(table(pred_nb_clasif)) * 100,
+        col = c("#6DBF8E", "#5B8DB8", "#E05C5C"), border = "white",
+        ylim = c(0, 60), las = 2,
+        main = "Distribución predicha — NB", ylab = "% de registros")
+par(mfrow = c(1, 1))
+```
+
+---
+
+# 8. Punto 6 — Análisis de eficiencia: Matriz de confusión
+```{r matriz_confusion}
+cm_nb <- confusionMatrix(pred_nb_clasif, test_df$categoria_precio)
+print(cm_nb)
+```
+```{r cm_manual}
+conf_mat_nb <- table(Real = test_df$categoria_precio,
+                     Predicho = pred_nb_clasif)
+
+cat("── Matriz de confusión ──\n")
+print(conf_mat_nb)
+
+cat("\n── Proporciones por fila (tasa de error por clase) ──\n")
+print(round(prop.table(conf_mat_nb, 1), 3))
+```
+```{r metricas_por_clase_nb}
+calcular_f1 <- function(cm, clase) {
+  tp <- cm[clase, clase]
+  fp <- sum(cm[, clase]) - tp
+  fn <- sum(cm[clase, ]) - tp
+  precision <- if ((tp + fp) > 0) tp / (tp + fp) else 0
+  recall    <- if ((tp + fn) > 0) tp / (tp + fn) else 0
+  f1        <- if ((precision + recall) > 0)
+                 2 * precision * recall / (precision + recall) else 0
+  list(precision = precision, recall = recall, f1 = f1)
+}
+
+cat("── Métricas por clase ──\n")
+metricas_nb <- data.frame(
+  Clase     = levels(test_df$categoria_precio),
+  Precision = numeric(3),
+  Recall    = numeric(3),
+  F1        = numeric(3)
+)
+
+for (i in seq_along(metricas_nb$Clase)) {
+  clase <- metricas_nb$Clase[i]
+  m     <- calcular_f1(conf_mat_nb, clase)
+  metricas_nb$Precision[i] <- round(m$precision, 3)
+  metricas_nb$Recall[i]    <- round(m$recall,    3)
+  metricas_nb$F1[i]        <- round(m$f1,        3)
+}
+print(metricas_nb)
+
+cat("\nAccuracy global:", round(acc_nb * 100, 2), "%\n")
+```
+```{r heatmap_confusion}
+# Heatmap de la matriz de confusión
+cm_df <- as.data.frame(conf_mat_nb)
+colnames(cm_df) <- c("Real", "Predicho", "Frecuencia")
+
+ggplot(cm_df, aes(x = Predicho, y = Real, fill = Frecuencia)) +
+  geom_tile(color = "white") +
+  geom_text(aes(label = Frecuencia), size = 5, fontface = "bold") +
+  scale_fill_gradient(low = "#EAF4FB", high = "#2E6DA4") +
+  labs(title  = "Matriz de confusión — Naive Bayes Clasificación",
+       x      = "Clase predicha",
+       y      = "Clase real",
+       fill   = "Frecuencia") +
+  theme_minimal(base_size = 13)
+```
+```{r cm_errores_analisis}
+# Errores por clase
+cat("── Errores de clasificación por clase ──\n")
+for (clase in levels(test_df$categoria_precio)) {
+  total_real    <- sum(conf_mat_nb[clase, ])
+  correctos     <- conf_mat_nb[clase, clase]
+  errores_clase <- total_real - correctos
+  tasa_error    <- errores_clase / total_real
+
+  cat(sprintf("  %s: %d errores de %d (%.1f%% tasa de error)\n",
+              clase, errores_clase, total_real, tasa_error * 100))
+}
+
+cat("\n── ¿Dónde se equivoca más el modelo? ──\n")
+# Confusiones más frecuentes (fuera de la diagonal)
+for (real in levels(test_df$categoria_precio)) {
+  for (pred in levels(test_df$categoria_precio)) {
+    if (real != pred && conf_mat_nb[real, pred] > 0) {
+      cat(sprintf("  Real=%s → Predicho=%s : %d casos\n",
+                  real, pred, conf_mat_nb[real, pred]))
+    }
+  }
+}
+```
